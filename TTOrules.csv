@@ -1,0 +1,22 @@
+category,source,pattern,message,enabled
+syntax,masked_sql,\bMULTISET\b,Oracle 不支援 MULTISET table 定義語法 -> 改寫建表語法,Y
+syntax,masked_sql,\bTOP\s+\d+\b,Oracle 不支援 TOP -> FETCH FIRST n ROWS ONLY 或 ROWNUM,Y
+syntax,masked_sql,\bSAMPLE\b,Oracle 不支援 SAMPLE 語法 -> 確認是否需改寫抽樣方式,Y
+syntax,masked_sql,\bVOLATILE\b,Oracle 不支援 VOLATILE TABLE -> GTT 或其他暫存表策略,Y
+syntax,masked_sql,\bCOLLECT\s+STATISTICS\b,Oracle 不支援 COLLECT STATISTICS -> DBMS_STATS,Y
+syntax,masked_sql,\bLOCKING\b,Oracle 不支援 Teradata LOCKING 語法,Y
+syntax,masked_sql,\bDATABASE\b\s+\w+,Oracle 不支援 DATABASE 切換語法 -> schema.table,Y
+syntax,masked_sql,\bBT\b\s*;,Oracle 不支援 BT 交易起始語法,Y
+syntax,masked_sql,\bET\b\s*;,Oracle 不支援 ET 交易結束語法,Y
+syntax,masked_sql,\bZEROIFNULL\b,Oracle 不支援 ZEROIFNULL -> NVL(expr, 0),Y
+syntax,masked_sql,\bOREPLACE\b,Oracle 不支援 OREPLACE -> REPLACE,Y
+syntax,masked_sql,\bISNULL\s*\(,Oracle 不支援 ISNULL() -> NVL(),Y
+syntax,masked_sql,\bPOSITION\s*\(,Oracle 沒有 POSITION() 字串函式 -> INSTR(),Y
+syntax,masked_sql,\bCHAR_LENGTH\s*\(,Oracle 使用 LENGTH() -> 非 CHAR_LENGTH(),Y
+syntax,masked_sql,\bCHARACTER_LENGTH\s*\(,Oracle 使用 LENGTH() -> 非 CHARACTER_LENGTH(),Y
+syntax,masked_sql,\bVARCHAR\b(?!2)\b,VARCHAR -> VARCHAR2,Y
+syntax,masked_sql,\b(?:CHARACTER\s+SET|CHARCTER\s+SERT)\s+UNICODE\b,CHARACTER SET UNICODE -> NVARCHAR2,Y
+syntax,masked_sql,\bCURRENT_DATE\b,CURRENT_DATE -> TRUNC(SYSDATE),Y
+syntax,masked_sql,\bSUBSTRING\s*\([^)]*\bFROM\b[^)]*\bFOR\b[^)]*\),Teradata SUBSTRING(... FROM ... FOR ...) -> Oracle SUBSTR(),Y
+ods,masked_sql,\bUNION\s+ALL\b,ODS 不建議 UNION ALL,Y
+ods,masked_sql,\bSELECT\s+\*\b,ODS 不建議 SELECT * -> 明確列出欄位,Y
