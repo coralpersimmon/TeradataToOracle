@@ -3,7 +3,7 @@ import re
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import scrolledtext
+from tkinter import messagebox, scrolledtext
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -84,14 +84,20 @@ syntax_result_box = scrolledtext.ScrolledText(
 )
 syntax_result_box.pack(fill="both", expand=True)
 
+ods_content_frame = tk.Frame(ods_frame)
+ods_content_frame.pack(fill="both", expand=True)
+
+ods_action_frame = tk.Frame(ods_content_frame)
+ods_action_frame.pack(side="right", fill="y", padx=(8, 0))
+
 ods_result_box = scrolledtext.ScrolledText(
-    ods_frame,
+    ods_content_frame,
     height=12,
     font=("Consolas", 11),
     bg="white",
     fg="black",
 )
-ods_result_box.pack(fill="both", expand=True)
+ods_result_box.pack(side="left", fill="both", expand=True)
 
 text_box.tag_config("error", foreground="red")
 text_box.tag_config("bracket_error", background="red", foreground="white")
@@ -102,6 +108,12 @@ FUNCTION_LIKE_WORDS = [
     "CHARACTER_LENGTH", "SUM", "COUNT", "AVG", "MIN", "MAX", "NVL",
     "TRIM", "SUBSTR", "ROW_NUMBER",
 ]
+
+qualify_state = {
+    "window": None,
+    "input_box": None,
+    "output_box": None,
+}
 
 
 def load_rules():
@@ -301,6 +313,333 @@ def statement_line_col(statement: Statement, offset: int):
     return line_no, start_col
 
 
+def indent_block(text: str, spaces: int = 4) -> str:
+    prefix = " " * spaces
+    return "\n".join(prefix + line if line.strip() else "" for line in text.splitlines())
+
+
+def find_top_level_keyword(masked_sql: str, keyword: str, start: int = 0) -> int:
+    pattern = re.compile(rf"\b{re.escape(keyword)}\b", re.IGNORECASE)
+    depth = 0
+
+    for index, char in enumerate(masked_sql[start:], start=start):
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth > 0:
+            depth -= 1
+        elif depth == 0:
+            match = pattern.match(masked_sql, index)
+            if match:
+                return match.start()
+    return -1
+
+
+def split_top_level_commas(text: str, masked_text: str):
+    parts = []
+    start = 0
+    depth = 0
+
+    for index, char in enumerate(masked_text):
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth > 0:
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def derive_outer_column_name(select_item: str) -> str:
+    explicit_alias = re.search(r"\bAS\s+([A-Z][A-Z0-9_$#]*)\s*$", select_item, re.IGNORECASE)
+    if explicit_alias:
+        return explicit_alias.group(1)
+
+    bare_alias = re.search(r"\s+([A-Z][A-Z0-9_$#]*)\s*$", select_item, re.IGNORECASE)
+    if bare_alias and ")" not in bare_alias.group(1):
+        leading = select_item[:bare_alias.start()].rstrip()
+        if leading and not leading.endswith("."):
+            return bare_alias.group(1)
+
+    direct_column = re.search(r"(?:^|\.)([A-Z][A-Z0-9_$#]*)\s*$", select_item, re.IGNORECASE)
+    if direct_column:
+        return direct_column.group(1)
+
+    return select_item.strip()
+
+
+def build_outer_select_list(select_list_sql: str, select_list_masked: str) -> str:
+    items = split_top_level_commas(select_list_sql, select_list_masked)
+    if not items:
+        return "*"
+
+    distinct_prefix = ""
+    first_item = items[0]
+    distinct_match = re.match(r"^\s*DISTINCT\b", first_item, re.IGNORECASE)
+    if distinct_match:
+        distinct_prefix = "DISTINCT "
+        items[0] = first_item[distinct_match.end():].strip()
+        if not items[0]:
+            items = items[1:]
+
+    outer_items = [derive_outer_column_name(item) for item in items if item.strip()]
+    if not outer_items:
+        return distinct_prefix + "*"
+
+    return distinct_prefix + ",\n       ".join(outer_items)
+
+
+def extract_qualify_statement_parts(sql: str):
+    masked_sql = mask_preserve_length(sql)
+    qualify_pos = find_top_level_keyword(masked_sql, "QUALIFY")
+    if qualify_pos == -1:
+        raise ValueError("找不到頂層 QUALIFY")
+
+    prefix = sql[:qualify_pos].rstrip()
+    qualify_clause = sql[qualify_pos:].strip().rstrip(";").strip()
+    masked_prefix = masked_sql[:qualify_pos]
+
+    select_pos = find_top_level_keyword(masked_prefix, "SELECT")
+    if select_pos == -1:
+        raise ValueError("找不到可轉換的 SELECT 區段")
+
+    statement_prefix = prefix[:select_pos].rstrip()
+    select_sql = prefix[select_pos:].rstrip()
+    select_masked = masked_prefix[select_pos:].rstrip()
+
+    from_pos = find_top_level_keyword(select_masked, "FROM")
+    if from_pos == -1:
+        raise ValueError("SELECT 區段找不到 FROM")
+
+    select_keyword = re.match(r"\s*SELECT\b", select_sql, re.IGNORECASE)
+    select_list_sql = select_sql[select_keyword.end():from_pos].strip()
+    select_list_masked = select_masked[select_keyword.end():from_pos].strip()
+    from_sql = select_sql[from_pos:].strip()
+
+    return {
+        "statement_prefix": statement_prefix,
+        "select_list_sql": select_list_sql,
+        "select_list_masked": select_list_masked,
+        "from_sql": from_sql,
+        "qualify_clause": qualify_clause,
+    }
+
+
+def parse_qualify_clause(qualify_clause: str):
+
+    qualify_clause = qualify_clause.strip()
+
+    # CASE 1:
+    # QUALIFY ROW_NUMBER() OVER (...) = 1
+
+    pattern_window = re.compile(
+        r"^QUALIFY\s+"
+        r"(?P<func>ROW_NUMBER|RANK|DENSE_RANK)\s*\(\s*\)\s*"
+        r"OVER\s*(?P<over>\(.*\))\s*"
+        r"(?P<operator>=|<=|<|>=|>)\s*(?P<value>\d+)\s*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    match = pattern_window.match(qualify_clause)
+
+    if match:
+        return {
+            "mode": "window",
+            "function_name": match.group("func").upper(),
+            "over_clause": match.group("over").strip(),
+            "operator": match.group("operator"),
+            "value": match.group("value"),
+        }
+
+    # CASE 2:
+    # QUALIFY RN = 1
+
+    pattern_alias = re.compile(
+        r"^QUALIFY\s+"
+        r"(?P<alias>[A-Z][A-Z0-9_$#]*)\s*"
+        r"(?P<operator>=|<=|<|>=|>)\s*"
+        r"(?P<value>\d+)\s*$",
+        re.IGNORECASE,
+    )
+
+    match = pattern_alias.match(qualify_clause)
+
+    if match:
+        return {
+            "mode": "alias",
+            "alias": match.group("alias"),
+            "operator": match.group("operator"),
+            "value": match.group("value"),
+        }
+
+    raise ValueError(
+        "目前僅支援：\n"
+        "1. QUALIFY ROW_NUMBER/RANK/DENSE_RANK OVER (...) = 數字\n"
+        "2. QUALIFY alias = 數字"
+    )
+
+
+def convert_qualify_sql(sql: str) -> str:
+
+    parts = extract_qualify_statement_parts(sql)
+    qualify = parse_qualify_clause(parts["qualify_clause"])
+
+    outer_select_list = build_outer_select_list(
+        parts["select_list_sql"],
+        parts["select_list_masked"]
+    )
+
+    # CASE 1:
+    # QUALIFY ROW_NUMBER() OVER (...) = 1
+
+    if qualify["mode"] == "window":
+
+        analytic_line = (
+            f"{qualify['function_name']}() "
+            f"OVER {qualify['over_clause']} RN"
+        )
+
+        inner_select = (
+            "SELECT " + parts["select_list_sql"] + ",\n"
+            f"       {analytic_line}\n"
+            + parts["from_sql"]
+        ).strip()
+
+        where_clause = (
+            f"RN {qualify['operator']} {qualify['value']}"
+        )
+
+    # CASE 2:
+    # QUALIFY RN = 1
+
+    else:
+
+        inner_select = (
+            "SELECT " + parts["select_list_sql"] + "\n"
+            + parts["from_sql"]
+        ).strip()
+
+        where_clause = (
+            f"{qualify['alias']} "
+            f"{qualify['operator']} "
+            f"{qualify['value']}"
+        )
+
+    converted_parts = []
+
+    if parts["statement_prefix"]:
+        converted_parts.append(parts["statement_prefix"])
+
+    converted_parts.append(f"SELECT {outer_select_list}")
+    converted_parts.append("FROM")
+    converted_parts.append("(")
+    converted_parts.append(indent_block(inner_select, 4))
+    converted_parts.append(")")
+    converted_parts.append(f"WHERE {where_clause}")
+    converted_parts.append(";")
+
+    return "\n".join(converted_parts)
+
+
+def clear_qualify_output():
+    output_box = qualify_state["output_box"]
+    if output_box is None:
+        return
+    output_box.delete("1.0", tk.END)
+
+
+def run_qualify_conversion():
+    input_box = qualify_state["input_box"]
+    output_box = qualify_state["output_box"]
+    if input_box is None or output_box is None:
+        return
+
+    sql = input_box.get("1.0", tk.END).strip()
+    if not sql:
+        messagebox.showwarning("QUALIFY 轉換", "請先輸入含 QUALIFY 的 SQL")
+        return
+
+    try:
+        converted = convert_qualify_sql(sql)
+    except ValueError as exc:
+        converted = f"無法自動轉換：{exc}"
+
+    output_box.delete("1.0", tk.END)
+    output_box.insert("1.0", converted)
+
+
+def open_qualify_converter():
+    window = qualify_state["window"]
+    if window is not None and window.winfo_exists():
+        window.lift()
+        window.focus_force()
+        return
+
+    window = tk.Toplevel(root)
+    window.title("QUALIFY 轉換")
+    window.geometry("1000x700")
+    qualify_state["window"] = window
+
+    def on_close():
+        current_window = qualify_state["window"]
+        if current_window is not None and current_window.winfo_exists():
+            current_window.destroy()
+        qualify_state["window"] = None
+        qualify_state["input_box"] = None
+        qualify_state["output_box"] = None
+
+    window.protocol("WM_DELETE_WINDOW", on_close)
+
+    input_frame = tk.LabelFrame(window, text="QUALIFY SQL 輸入")
+    input_frame.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+
+    input_box = scrolledtext.ScrolledText(
+        input_frame,
+        height=14,
+        font=("Consolas", 11),
+        bg="white",
+        fg="black",
+        wrap="none",
+    )
+    input_box.pack(fill="both", expand=True, padx=8, pady=8)
+    qualify_state["input_box"] = input_box
+
+    action_frame = tk.Frame(window)
+    action_frame.pack(fill="x", padx=10, pady=5)
+
+    tk.Button(
+        action_frame,
+        text="轉換",
+        font=("Microsoft JhengHei", 11),
+        command=run_qualify_conversion,
+    ).pack(side="left")
+
+    tk.Button(
+        action_frame,
+        text="清空結果",
+        font=("Microsoft JhengHei", 11),
+        command=clear_qualify_output,
+    ).pack(side="left", padx=(8, 0))
+
+    output_frame = tk.LabelFrame(window, text="Oracle 建議轉換")
+    output_frame.pack(fill="both", expand=True, padx=10, pady=(5, 10))
+
+    output_box = scrolledtext.ScrolledText(
+        output_frame,
+        height=14,
+        font=("Consolas", 11),
+        bg="white",
+        fg="black",
+        wrap="none",
+    )
+    output_box.pack(fill="both", expand=True, padx=8, pady=8)
+    qualify_state["output_box"] = output_box
+
+
 def mark_issue_lines(issues):
     marked_lines = sorted({item.line for item in issues if item.line is not None})
     for line_no in marked_lines:
@@ -370,6 +709,38 @@ def check_common_structure(masked_sql, issues):
     for match in re.finditer(r",\s*,", masked_sql):
         line_no = masked_sql.count("\n", 0, match.start()) + 1
         add_issue(issues, line_no, "連續逗號，欄位清單可能有缺值", "syntax")
+
+
+def check_alias_without_join(statements, issues):
+    alias_column_pattern = re.compile(r"\b([A-Z][A-Z0-9_$#]*)\.([A-Z][A-Z0-9_$#]*)\b", re.IGNORECASE)
+    schema_table_pattern = re.compile(
+        r"^\s*(?:FROM|JOIN|UPDATE|INTO|DELETE\s+FROM|MERGE\s+INTO)\s+"
+        r"[A-Z0-9_$#]+\.([A-Z0-9_$#]+)",
+        re.IGNORECASE,
+    )
+
+    for statement in statements:
+        if re.search(r"\bJOIN\b", statement.masked_text, re.IGNORECASE):
+            continue
+
+        for match in alias_column_pattern.finditer(statement.masked_text):
+            line_start = statement.masked_text.rfind("\n", 0, match.start()) + 1
+            line_end = statement.masked_text.find("\n", match.start())
+            if line_end == -1:
+                line_end = len(statement.masked_text)
+            line_text = statement.masked_text[line_start:line_end]
+
+            if schema_table_pattern.search(line_text):
+                continue
+
+            line_no, start_col = statement_line_col(statement, match.start())
+            add_tag(line_no, start_col, start_col + len(match.group(0)))
+            add_issue(
+                issues,
+                line_no,
+                "未使用 JOIN 時，不應使用別名.欄位 的引用方式",
+                "syntax",
+            )
 
 
 def check_primary_index_context(statements, issues):
@@ -637,6 +1008,7 @@ def check_sql():
     check_parentheses(masked_sql, issues)
     check_case_end(masked_sql, issues)
     check_common_structure(masked_sql, issues)
+    check_alias_without_join(statements, issues)
     check_primary_index_context(statements, issues)
     check_index_function(statements, issues)
     check_function_parentheses(masked_sql, issues)
@@ -661,6 +1033,15 @@ btn = tk.Button(
     command=check_sql,
 )
 btn.pack(pady=5)
+
+qualify_btn = tk.Button(
+    ods_action_frame,
+    text="QUALIFY\n轉換",
+    font=("Microsoft JhengHei", 11),
+    width=10,
+    command=open_qualify_converter,
+)
+qualify_btn.pack(anchor="n")
 
 
 line_box.tag_configure("line_numbers", justify="right")
