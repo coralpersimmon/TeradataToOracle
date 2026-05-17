@@ -109,6 +109,27 @@ FUNCTION_LIKE_WORDS = [
     "TRIM", "SUBSTR", "ROW_NUMBER",
 ]
 
+TYPO_MAP = {
+    "SELCET": "SELECT", "SLECT": "SELECT", "SELEECT": "SELECT", "SELECTE": "SELECT",
+    "FORM": "FROM", "FOMR": "FROM", "FRON": "FROM",
+    "WHRE": "WHERE", "HWERE": "WHERE", "WHEER": "WHERE",
+    "INSRET": "INSERT", "INSER": "INSERT",
+    "UDPATE": "UPDATE", "UPDAET": "UPDATE",
+    "DELTE": "DELETE", "DLEET": "DELETE",
+    "GRUOP": "GROUP",
+    "ODRER": "ORDER", "OREDER": "ORDER",
+    "HAIVNG": "HAVING", "HAVNG": "HAVING",
+    "JOIIN": "JOIN", "JION": "JOIN",
+    "VLAUES": "VALUES", "VALEUS": "VALUES",
+    "CERATE": "CREATE", "CRAETE": "CREATE",
+    "TABEL": "TABLE", "TALBE": "TABLE",
+    "DISTINT": "DISTINCT", "DISTNCT": "DISTINCT",
+    "BEWEEN": "BETWEEN", "BETWEN": "BETWEEN",
+    "UINON": "UNION", "UNOIN": "UNION",
+    "MERG": "MERGE", "MREGE": "MERGE",
+    "DISTINCT": "DISTICT"
+}
+
 qualify_state = {
     "window": None,
     "input_box": None,
@@ -352,6 +373,19 @@ def split_top_level_commas(text: str, masked_text: str):
     if tail:
         parts.append(tail)
     return parts
+
+
+def find_matching_close_paren(masked_text: str, open_pos: int) -> int:
+    """Return absolute index of the ')' matching the '(' at open_pos, or -1."""
+    depth = 0
+    for i in range(open_pos, len(masked_text)):
+        if masked_text[i] == "(":
+            depth += 1
+        elif masked_text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
 
 
 def derive_outer_column_name(select_item: str) -> str:
@@ -863,6 +897,554 @@ def check_inline_view_alias(statements, issues):
             )
 
 
+def check_typos(masked_sql, issues):
+    for typo, correct in TYPO_MAP.items():
+        for match in re.finditer(rf"\b{re.escape(typo)}\b", masked_sql, re.IGNORECASE):
+            line_no = masked_sql.count("\n", 0, match.start()) + 1
+            line_start = masked_sql.rfind("\n", 0, match.start()) + 1
+            start_col = match.start() - line_start
+            add_tag(line_no, start_col, start_col + len(match.group(0)))
+            add_issue(
+                issues,
+                line_no,
+                f"疑似打字錯誤：'{match.group(0).upper()}' -> 是否為 '{correct}'？",
+                "syntax",
+            )
+
+
+def check_insert_column_count(statements, issues):
+    for statement in statements:
+        if statement.first_keyword != "INSERT":
+            continue
+
+        masked = statement.masked_text
+        sql = statement.text
+
+        insert_match = re.search(
+            r"\bINSERT\s+INTO\s+[A-Z0-9_.$#\"]+\s*\(",
+            masked, re.IGNORECASE,
+        )
+        if not insert_match:
+            continue
+
+        col_open = insert_match.end() - 1
+        col_close = find_matching_close_paren(masked, col_open)
+        if col_close == -1:
+            continue
+
+        col_parts = [
+            p for p in split_top_level_commas(
+                sql[col_open + 1:col_close],
+                masked[col_open + 1:col_close],
+            )
+            if p.strip()
+        ]
+        col_count = len(col_parts)
+        if col_count == 0:
+            continue
+
+        after = col_close + 1
+
+        sel_match = re.search(r"\bSELECT\b", masked[after:], re.IGNORECASE)
+        val_match = re.search(r"\bVALUES\s*\(", masked[after:], re.IGNORECASE)
+
+        if sel_match:
+            sel_end_abs = after + sel_match.end()
+
+            distinct_m = re.match(r"\s*DISTINCT\b", masked[sel_end_abs:], re.IGNORECASE)
+            if distinct_m:
+                sel_end_abs += distinct_m.end()
+
+            from_pos = find_top_level_keyword(masked, "FROM", sel_end_abs)
+            if from_pos == -1:
+                continue
+
+            sel_list_masked = masked[sel_end_abs:from_pos].strip()
+            if re.fullmatch(r"\s*\*\s*", sel_list_masked):
+                continue
+
+            sel_parts = [
+                p for p in split_top_level_commas(
+                    sql[sel_end_abs:from_pos].strip(),
+                    sel_list_masked,
+                )
+                if p.strip()
+            ]
+            sel_count = len(sel_parts)
+
+            if col_count != sel_count:
+                line_no = statement.start_line
+                add_issue(
+                    issues, line_no,
+                    f"INSERT 欄位數({col_count})與 SELECT 欄位數({sel_count})不一致",
+                    "syntax",
+                )
+
+        elif val_match:
+            val_open_abs = after + val_match.end() - 1
+            val_close_abs = find_matching_close_paren(masked, val_open_abs)
+            if val_close_abs == -1:
+                continue
+
+            val_parts = [
+                p for p in split_top_level_commas(
+                    sql[val_open_abs + 1:val_close_abs],
+                    masked[val_open_abs + 1:val_close_abs],
+                )
+                if p.strip()
+            ]
+            val_count = len(val_parts)
+
+            if col_count != val_count:
+                line_no = statement.start_line
+                add_issue(
+                    issues, line_no,
+                    f"INSERT 欄位數({col_count})與 VALUES 數量({val_count})不一致",
+                    "syntax",
+                )
+
+
+def check_oracle_structure(statements, issues):
+    for statement in statements:
+        masked = statement.masked_text
+
+        # = NULL / != NULL / <> NULL
+        for match in re.finditer(r"(=|!=|<>)\s*NULL\b", masked, re.IGNORECASE):
+            op = match.group(1)
+            suggestion = "IS NULL" if op == "=" else "IS NOT NULL"
+            line_no, start_col = statement_line_col(statement, match.start())
+            add_tag(line_no, start_col, start_col + len(match.group(0)))
+            add_issue(
+                issues, line_no,
+                f"NULL 比較應使用 {suggestion}，不可寫 '{op} NULL'",
+                "syntax",
+            )
+
+        # NULL = / NULL != / NULL <>
+        for match in re.finditer(r"\bNULL\s*(=|!=|<>)", masked, re.IGNORECASE):
+            line_no, start_col = statement_line_col(statement, match.start())
+            add_tag(line_no, start_col, start_col + len(match.group(0)))
+            add_issue(
+                issues, line_no,
+                "NULL 比較應使用 IS NULL / IS NOT NULL，不可直接用 = 或 <> NULL",
+                "syntax",
+            )
+
+        # ROWNUM 在 WHERE 條件 + 同層 ORDER BY -> 排序失效風險
+        where_pos = find_top_level_keyword(masked, "WHERE")
+        order_pos = find_top_level_keyword(masked, "ORDER")
+        if where_pos != -1 and order_pos != -1 and order_pos > where_pos:
+            if re.search(r"\bROWNUM\b", masked[where_pos:order_pos], re.IGNORECASE):
+                add_issue(
+                    issues, statement.start_line,
+                    "ROWNUM 與 ORDER BY 同層：ROWNUM 篩選在排序前執行，結果可能不符預期，建議改用子查詢",
+                    "syntax",
+                )
+
+        # SELECT 無 FROM（Oracle 需要 FROM DUAL）
+        if statement.first_keyword == "SELECT":
+            if find_top_level_keyword(masked, "FROM") == -1:
+                add_issue(
+                    issues, statement.start_line,
+                    "Oracle SELECT 若無查詢來源表，應加上 FROM DUAL",
+                    "syntax",
+                )
+
+
+def check_insert_no_column_list(statements, issues):
+    for statement in statements:
+        if statement.first_keyword != "INSERT":
+            continue
+        masked = statement.masked_text
+        # 負向預視必須包含 \s*，否則 \s* 回溯後看到空格就誤判通過
+        match = re.search(
+            r"\bINSERT\s+INTO\s+[A-Z0-9_.$#\"]+(?!\s*\()",
+            masked, re.IGNORECASE,
+        )
+        if match:
+            line_no = statement.start_line
+            add_issue(
+                issues, line_no,
+                "INSERT 未指定欄位清單，若目標表結構異動將導致 ORA-00947，建議補上明確欄位清單",
+                "syntax",
+            )
+
+
+def check_group_by_position(statements, issues):
+    group_by_pattern = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
+    terminal_keywords = ("HAVING", "ORDER", "UNION", "INTERSECT", "MINUS", "EXCEPT")
+
+    for statement in statements:
+        masked = statement.masked_text
+        sql = statement.text
+
+        for match in group_by_pattern.finditer(masked):
+            # 跳過子查詢內部的 GROUP BY（括號深度 > 0）
+            depth = 0
+            for ch in masked[:match.start()]:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+            if depth != 0:
+                continue
+
+            after = match.end()
+
+            # 找出頂層 GROUP BY 子句的結尾
+            clause_end = len(masked)
+            for kw in terminal_keywords:
+                pos = find_top_level_keyword(masked, kw, after)
+                if -1 < pos < clause_end:
+                    clause_end = pos
+
+            items = split_top_level_commas(
+                sql[after:clause_end],
+                masked[after:clause_end],
+            )
+
+            if any(re.match(r"^\s*\d+\s*$", item) for item in items):
+                line_no, start_col = statement_line_col(statement, match.start())
+                add_tag(line_no, start_col, start_col + len(match.group(0)))
+                add_issue(
+                    issues, line_no,
+                    "GROUP BY 使用位置編號，Oracle group_by_position_enabled 預設 FALSE，需改為明確欄位名稱",
+                    "syntax",
+                )
+
+
+def check_blank_lines_in_statement(statements, issues):
+    for statement in statements:
+        lines = statement.text.split("\n")
+        for rel_idx, line in enumerate(lines):
+            if not line.strip():
+                abs_line = statement.start_line + rel_idx
+                add_issue(
+                    issues, abs_line,
+                    "SQL 陳述式內有空行，SQL*Plus 將空行視為終止符，"
+                    "PARTITION / 多行結構會在此被截斷，請移除空行",
+                    "syntax",
+                )
+
+
+def _count_select_cols(branch_sql: str, branch_masked: str):
+    """SELECT 欄位數計算輔助（UNION 一致性檢查用）；無法判斷時回傳 None。"""
+    with_pos = find_top_level_keyword(branch_masked, "WITH")
+    select_pos = find_top_level_keyword(branch_masked, "SELECT")
+    if select_pos == -1:
+        return None
+    if with_pos != -1 and with_pos < select_pos:
+        return None  # WITH CTE 結構太複雜，略過
+    select_end = select_pos + len("SELECT")
+    dm = re.match(r"\s+DISTINCT\b", branch_masked[select_end:], re.IGNORECASE)
+    if dm:
+        select_end += dm.end()
+    from_pos = find_top_level_keyword(branch_masked, "FROM", select_end)
+    if from_pos == -1:
+        return None
+    col_masked = branch_masked[select_end:from_pos].strip()
+    if re.fullmatch(r"\s*\*\s*", col_masked):
+        return None  # SELECT * 無法計數
+    parts = [p for p in split_top_level_commas(
+        branch_sql[select_end:from_pos].strip(), col_masked) if p.strip()]
+    return len(parts) if parts else None
+
+
+# ── DML 安全性檢查 ───────────────────────────────────────────────────────────
+
+def check_dml_without_where(statements, issues):
+    for statement in statements:
+        masked = statement.masked_text
+        kw = statement.first_keyword
+
+        if kw == "UPDATE":
+            if find_top_level_keyword(masked, "WHERE") == -1:
+                add_issue(issues, statement.start_line,
+                    "UPDATE 缺少 WHERE 條件，將更新全表所有資料列，請確認是否刻意為之",
+                    "syntax")
+
+        elif kw == "DELETE":
+            if find_top_level_keyword(masked, "WHERE") == -1:
+                add_issue(issues, statement.start_line,
+                    "DELETE 缺少 WHERE 條件，將刪除全表所有資料列，請確認是否刻意為之",
+                    "syntax")
+
+
+# ── 聚合 / GROUP BY 結構 ──────────────────────────────────────────────────────
+
+def check_having_without_group_by(statements, issues):
+    for statement in statements:
+        masked = statement.masked_text
+        having_pos = find_top_level_keyword(masked, "HAVING")
+        if having_pos == -1:
+            continue
+        if find_top_level_keyword(masked, "GROUP") == -1:
+            line_no, start_col = statement_line_col(statement, having_pos)
+            add_tag(line_no, start_col, start_col + len("HAVING"))
+            add_issue(issues, line_no,
+                "HAVING 缺少對應的 GROUP BY，Oracle 將報語法錯誤 ORA-00935", "syntax")
+
+
+def check_redundant_distinct(statements, issues):
+    for statement in statements:
+        masked = statement.masked_text
+        select_pos = find_top_level_keyword(masked, "SELECT")
+        if select_pos == -1:
+            continue
+        after_select = masked[select_pos + len("SELECT"):]
+        if not re.match(r"\s+DISTINCT\b", after_select, re.IGNORECASE):
+            continue
+        if find_top_level_keyword(masked, "GROUP") != -1:
+            line_no, start_col = statement_line_col(statement, select_pos)
+            add_issue(issues, line_no,
+                "SELECT DISTINCT 與 GROUP BY 同時使用，DISTINCT 冗餘，建議移除", "syntax")
+
+
+# ── JOIN / 子查詢結構 ─────────────────────────────────────────────────────────
+
+def check_cartesian_join(statements, issues):
+    for statement in statements:
+        masked = statement.masked_text
+        if re.search(r"\bJOIN\b", masked, re.IGNORECASE):
+            continue
+        from_pos = find_top_level_keyword(masked, "FROM")
+        if from_pos == -1:
+            continue
+        from_end = len(masked)
+        for kw in ("WHERE", "GROUP", "ORDER", "HAVING", "UNION", "INTERSECT", "MINUS"):
+            pos = find_top_level_keyword(masked, kw, from_pos + 4)
+            if -1 < pos < from_end:
+                from_end = pos
+        depth = 0
+        for ch in masked[from_pos + 4:from_end]:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                line_no, start_col = statement_line_col(statement, from_pos)
+                add_issue(issues, line_no,
+                    "FROM 使用逗號分隔多表（隱式 CROSS JOIN），可能產生笛卡爾積，"
+                    "建議改用明確 JOIN ... ON 語法", "syntax")
+                break
+
+
+def check_not_in_subquery(statements, issues):
+    pattern = re.compile(r"\bNOT\s+IN\s*\(\s*SELECT\b", re.IGNORECASE)
+    for statement in statements:
+        for match in pattern.finditer(statement.masked_text):
+            line_no, start_col = statement_line_col(statement, match.start())
+            end_col = start_col + len("NOT IN")
+            add_tag(line_no, start_col, end_col)
+            add_issue(issues, line_no,
+                "NOT IN (SELECT...) 若子查詢結果含 NULL，整個條件回傳空集合，"
+                "建議改用 NOT EXISTS 以避免 NULL 陷阱", "syntax")
+
+
+# ── UNION 欄位數一致性 ────────────────────────────────────────────────────────
+
+def check_union_column_count(statements, issues):
+    union_pattern = re.compile(
+        r"\bUNION(?:\s+ALL)?\b|\bINTERSECT\b|\bMINUS\b|\bEXCEPT\b", re.IGNORECASE)
+
+    for statement in statements:
+        masked = statement.masked_text
+        sql = statement.text
+
+        split_pairs = []
+        for match in union_pattern.finditer(masked):
+            depth = 0
+            for ch in masked[:match.start()]:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+            if depth == 0:
+                split_pairs.append((match.start(), match.end()))
+
+        if not split_pairs:
+            continue
+
+        # 建立各分支範圍
+        boundaries = []
+        prev = 0
+        for start, end in split_pairs:
+            boundaries.append((prev, start))
+            prev = end
+        boundaries.append((prev, len(masked)))
+
+        counts = [_count_select_cols(sql[s:e], masked[s:e]) for s, e in boundaries]
+        valid = [c for c in counts if c is not None]
+        if len(valid) >= 2 and len(set(valid)) > 1:
+            counts_str = " / ".join(
+                str(c) if c is not None else "?" for c in counts)
+            add_issue(issues, statement.start_line,
+                f"UNION / INTERSECT / MINUS 各分支欄位數不一致（{counts_str}），"
+                "Oracle 將報 ORA-01789", "syntax")
+
+
+# ── ORDER BY 結構 ─────────────────────────────────────────────────────────────
+
+def check_order_by_position(statements, issues):
+    ob_pattern = re.compile(r"\bORDER\s+BY\b", re.IGNORECASE)
+    for statement in statements:
+        masked = statement.masked_text
+        sql = statement.text
+        for match in ob_pattern.finditer(masked):
+            depth = 0
+            for ch in masked[:match.start()]:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+            if depth != 0:
+                continue
+            after = match.end()
+            fetch_pos = find_top_level_keyword(masked, "FETCH", after)
+            clause_end = fetch_pos if fetch_pos != -1 else len(masked)
+            items = split_top_level_commas(sql[after:clause_end], masked[after:clause_end])
+            has_pos = any(
+                re.match(r"^\s*\d+\s*$",
+                    re.sub(r"\b(?:ASC|DESC)\b", "", item, flags=re.IGNORECASE).strip())
+                for item in items
+            )
+            if has_pos:
+                line_no, start_col = statement_line_col(statement, match.start())
+                add_tag(line_no, start_col, start_col + len(match.group(0)))
+                add_issue(issues, line_no,
+                    "ORDER BY 使用位置編號，可讀性差且維護困難，建議改為明確欄位名稱",
+                    "syntax")
+
+
+# ── 表達式 / 條件邏輯 ─────────────────────────────────────────────────────────
+
+def check_like_no_wildcard(statements, issues):
+    # 在原始 SQL（非 masked）中搜尋，才能看到字串內容
+    pattern = re.compile(r"\bLIKE\s+'([^'%_\n]*)'", re.IGNORECASE)
+    for statement in statements:
+        for match in pattern.finditer(statement.text):
+            if not match.group(1):          # LIKE '' 另由 empty_string 檢查
+                continue
+            line_no, start_col = statement_line_col(statement, match.start())
+            add_tag(line_no, start_col, start_col + len(match.group(0)))
+            add_issue(issues, line_no,
+                f"LIKE '{match.group(1)}' 不含萬用字元(%/_)，效果等同 =，"
+                "建議改用 = 或確認是否遺漏 %", "syntax")
+
+
+_ORACLE_TYPES = (
+    r"DATE|TIMESTAMP|NUMBER|DECIMAL|INTEGER|INT\b|SMALLINT|FLOAT|REAL|"
+    r"BINARY_FLOAT|BINARY_DOUBLE|VARCHAR2|CHAR|NVARCHAR2|NCHAR|"
+    r"CLOB|BLOB|NCLOB|RAW|INTERVAL"
+)
+_COL_DEF_START = re.compile(
+    rf"^\s+[A-Z_][A-Z0-9_$#]*\s+(?:{_ORACLE_TYPES})\b",
+    re.IGNORECASE,
+)
+
+
+def check_create_table_col_missing_comma(statements, issues):
+    """偵測 CREATE TABLE 欄位定義清單中連續欄位之間缺少逗號的情況。"""
+    for statement in statements:
+        if statement.first_keyword != "CREATE":
+            continue
+        masked = statement.masked_text
+        sql = statement.text
+        if not re.search(r"\bTABLE\b", masked, re.IGNORECASE):
+            continue
+
+        # 找到緊接資料表名稱的 (，即欄位定義清單的開頭
+        table_match = re.search(
+            r"\bCREATE\s+(?:\w+\s+)*TABLE\s+[^\s(]+\s*\(",
+            masked, re.IGNORECASE,
+        )
+        if not table_match:
+            continue
+
+        col_open  = table_match.end() - 1
+        col_close = find_matching_close_paren(masked, col_open)
+        if col_close == -1:
+            continue
+
+        col_block_sql    = sql[col_open + 1:col_close]
+        col_block_masked = masked[col_open + 1:col_close]
+
+        # 欄位區塊第一行的絕對行號偏移量
+        base_offset = masked[:col_open + 1].count("\n")
+
+        lines_sql    = col_block_sql.split("\n")
+        lines_masked = col_block_masked.split("\n")
+
+        prev_idx = -1  # 前一個有效行（非空白、非純註解）的索引
+
+        for i, (lsql, lmasked) in enumerate(zip(lines_sql, lines_masked)):
+            if not lmasked.strip():
+                continue
+            if lsql.strip().startswith(("--", "/*")):
+                continue
+
+            # 此行是否為新欄位定義的起始（識別符 + 型別關鍵字）
+            if _COL_DEF_START.match(lmasked):
+                if prev_idx >= 0:
+                    prev_clean = re.sub(r"--.*$", "", lines_sql[prev_idx]).rstrip()
+                    if not prev_clean.endswith(","):
+                        abs_line = statement.start_line + base_offset + prev_idx
+                        add_tag(abs_line, 0, 0, "line_error")
+                        add_issue(
+                            issues, abs_line,
+                            "CREATE TABLE 欄位定義之間缺少逗號",
+                            "syntax",
+                        )
+
+            prev_idx = i
+
+
+def check_partition_missing_comma(statements, issues):
+    """偵測 PARTITION BY 定義區塊中 VALUES LESS THAN (...) 後缺少逗號的情況。"""
+    vlt_pattern = re.compile(r"\bVALUES\s+(?:LESS\s+THAN\s*)?\(", re.IGNORECASE)
+
+    for statement in statements:
+        if statement.first_keyword != "CREATE":
+            continue
+        masked = statement.masked_text
+        if not re.search(r"\bPARTITION\s+BY\b", masked, re.IGNORECASE):
+            continue
+
+        for match in vlt_pattern.finditer(masked):
+            paren_open = match.end() - 1
+            paren_close = find_matching_close_paren(masked, paren_open)
+            if paren_close == -1:
+                continue
+
+            # 找 ) 之後第一個非空白字元
+            rest = masked[paren_close + 1:]
+            next_nonws = re.search(r"\S", rest)
+            if not next_nonws:
+                continue
+
+            # 若緊接的是 PARTITION 關鍵字（不是逗號），則缺少逗號
+            if re.match(r"PARTITION\b", rest[next_nonws.start():], re.IGNORECASE):
+                line_no, start_col = statement_line_col(statement, paren_close)
+                add_tag(line_no, start_col, start_col + 1)
+                add_issue(
+                    issues, line_no,
+                    "PARTITION 定義之間缺少逗號，VALUES LESS THAN (...) 後應補上 ,",
+                    "syntax",
+                )
+
+
+def check_empty_string_comparison(statements, issues):
+    # Oracle 中 '' 等同 NULL，= '' 條件永遠不成立
+    pattern = re.compile(r"(?:(?:=|<>|!=)\s*''|''\s*(?:=|<>|!=))")
+    for statement in statements:
+        for match in pattern.finditer(statement.text):
+            line_no, start_col = statement_line_col(statement, match.start())
+            add_tag(line_no, start_col, start_col + len(match.group(0)))
+            add_issue(issues, line_no,
+                "Oracle 空字串 '' 等同於 NULL，= '' 條件永遠不成立，應改用 IS NULL",
+                "syntax")
+
+
 def check_ods_delete(statements, issues):
     pattern = re.compile(r"^\s*DELETE\b", re.IGNORECASE)
     for statement in statements:
@@ -1016,6 +1598,23 @@ def check_sql():
     check_qualify_conversion(statements, issues)
     check_format_conversion(statements, issues)
     check_inline_view_alias(statements, issues)
+    check_typos(masked_sql, issues)
+    check_insert_column_count(statements, issues)
+    check_oracle_structure(statements, issues)
+    check_insert_no_column_list(statements, issues)
+    check_group_by_position(statements, issues)
+    check_blank_lines_in_statement(statements, issues)
+    check_dml_without_where(statements, issues)
+    check_having_without_group_by(statements, issues)
+    check_redundant_distinct(statements, issues)
+    check_cartesian_join(statements, issues)
+    check_not_in_subquery(statements, issues)
+    check_union_column_count(statements, issues)
+    check_order_by_position(statements, issues)
+    check_like_no_wildcard(statements, issues)
+    check_empty_string_comparison(statements, issues)
+    check_create_table_col_missing_comma(statements, issues)
+    check_partition_missing_comma(statements, issues)
     check_ods_delete(statements, issues)
     check_ods_create_index_order(statements, issues)
     check_ods_create_table_options(statements, issues)
